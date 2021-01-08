@@ -137,23 +137,31 @@ bayes_dydx_ordinal.factor <- function(model, data = NULL, variable, re_formula =
 
 ```
 
-The example is from [here](https://stats.idre.ucla.edu/r/dae/ordinal-logistic-regression/). 
+The example uses the `nhanes2` dataset, which is from the `webuse` package. 
 
-Below is the example for `margins`. 
 
 ```{r EG}
 
-dat <- foreign::read.dta("https://stats.idre.ucla.edu/stat/data/ologit.dta") %>% 
-  mutate(gpa_grp = case_when(gpa < 2.85 ~ "C",
-                             gpa >= 2.85 & gpa < 3.3 ~ "B",
-                             TRUE ~ "A"),
-         apply = ordered(apply, levels = c("unlikely", 
-                                           "somewhat likely", 
-                                           "very likely"))) %>% 
-  mutate_at(vars(pared, public), as.factor)
+webuse::webuse("nhanes2")
 
-ord_m_flat <- MASS::polr( apply ~ pared + public + gpa_grp, data = dat, Hess=TRUE)
+nhanes2_a = nhanes2 %>% 
+  select(hlthstat,diabetes, black, female, age) %>% 
+  na.omit(.) %>% 
+  filter(hlthstat != 8) %>% 
+  mutate(health = case_when(hlthstat == 5 ~ "poor",
+                            hlthstat == 4 ~"fair",
+                            hlthstat == 3 ~"average",
+                            hlthstat == 2 ~"good",
+                            hlthstat == 1 ~"excellent") %>% as.factor(.),
+         health = ordered(health , levels = c("poor", "fair", "average", 
+                                              "good", "excellent") )) %>% 
+  mutate_at(vars(female, black), as.factor)
 
+Model = MASS::polr(health ~ female + black + age, data = nhanes2_a , Hess = TRUE)
+
+MarginalEffects = summary(margins::margins(Model)) %>% 
+  as_tibble() %>% 
+  select(factor , AME)
 
 ```
 
@@ -161,17 +169,29 @@ We next run the ordinal Bayesian model using `brms`. The code is below:
 
 ```{r Bayes , echo = TRUE}
 
+
 # Fit Bayesian model
-bayes_ordinal <- brm(formula = apply ~ pared + public+gpa_grp,
+bayes_ordinal <- brm(formula = health ~ female + black + age,
              family=cumulative("logit"),
              prior = c(prior(normal( 0, 1), class = b)),
-             data = dat,
-            warmup = 2000, 
-            iter = 4000, 
+             data = nhanes2_a,
+            warmup = 1000, 
+            iter = 2000, 
              chains = 2,
              cores = 2)
 
+AMEByVar = function(x,y) {
+  
+ ParedEst = bayes_dydx_ordinal.factor(bayes_ordinal , nhanes2_a, variable = x ) %>% 
+    group_by(Category, resp) %>% 
+    summarise(p50 = median(est)) %>% 
+    ungroup() %>% 
+    mutate(Var = x)
 
+}
+ 
+BayesAME = purrr::map(as.list(c("black", "female")), AMEByVar) %>% 
+  bind_rows(.)
 
 ```
 
@@ -189,7 +209,7 @@ FixedBayes = FixedBayes_a %>%
                           value == "Intercept[2]" ~ "somewhat likely|very likely",
                           TRUE ~ value)) %>%
   select(-value , -Est.Error) %>% 
-  inner_join(broom::tidy(ord_m_flat , conf.int = TRUE) %>% 
+  inner_join(broom::tidy(Model , conf.int = TRUE) %>% 
                select(term,estimate, conf.low, conf.high), by = "term") %>% 
   select(term , Estimate, Q2.5, Q97.5 , estimate, conf.low, conf.high) %>% 
   mutate_if(is.numeric , ~ round(. , digits = 3))
@@ -223,34 +243,122 @@ We next use the adapted function `bayes_dydx_ordinal.factor` to compare the marg
 
 ```{r Comparison}
 
-marginalEff = margins::margins(ord_m_flat)
 
-AMEByVar = function(x) {
-
-  ParedEst = bayes_dydx_ordinal.factor(bayes_ordinal , variable = x ) %>% 
-    group_by(Category) %>% 
-    summarise(p50 = median(est)) %>% 
-    ungroup() %>% 
-    mutate(Var = x)
-
-}
-
-
-BayesAME = purrr::map(as.list(c("pared", "public", "gpa_grp")), AMEByVar) %>% 
-  bind_rows(.)
+MarginalEffects_2 = purrr::map_dfr(seq_len(5), ~MarginalEffects) %>% 
+  filter(factor != "age") %>% 
+  group_by(factor) %>% 
+  mutate(Category = row_number() %>% as.character(.)) %>% 
+  ungroup() %>% 
+  mutate(Var = stringi::stri_replace_all_regex(factor , "[[:digit:]]", "") ,
+         resp =stringi::stri_replace_all_regex(factor , "[[:alpha:]]", "")  ) %>% 
+  select(-factor) %>% 
+  inner_join(BayesAME , by = c("Category", "resp", "Var")) %>% 
+  mutate(`Health Status` = case_when(Category == 1 ~ "poor",
+                            Category == 2 ~"fair",
+                            Category == 3 ~"average",
+                            Category == 4 ~"good",
+                            Category == 5 ~"excellent") ) %>% 
+  select(`Health Status`, Response = Var, AME , AME_Bayes = p50)
 
 ```
 
-Below we compare the marginal effects from the `bayes_dydx_ordinal.factor` function to the `margins` function. Importantly, there is no documentation on how `margins` works with ordinal regressions. There is great documentation [here]() and a great technical [paper](), but neither covers ordinal regression.  
+Below we compare the marginal effects from the `bayes_dydx_ordinal.factor` function to the `margins` function. Importantly, there is no documentation on how `margins` works with ordinal regressions. There is great documentation [here](https://cran.r-project.org/web/packages/margins/vignettes/Introduction.html) and a great technical [paper](https://cran.r-project.org/web/packages/margins/margins.pdf), but neither covers ordinal regression.  
+
+```{r MarginComparison}
+
+CoefTableComp <- 
+  gt::gt(data = MarginalEffects_2) %>%
+  gt::tab_header(
+    title = "Average Marginal Effects Comparison"
+  ) %>%
+  gt::tab_spanner(
+    label = "Average Marginal Effects",
+    columns = vars(AME, AME_Bayes)
+  )
+
+CoefTableComp
+
+```
+
+
+As we can see the marginal effects from the `margins` package do not match `bayes_dydx_ordinal.factor`. However, the `margins` estimates do not vary by outcome level. They are very similar at the first level, or health status equal to poor compared to the estimates from `bayes_dydx_ordinal.factor`, but vary considerably from the other outcomes. 
+
+### Looking at STATA
 
 STATA users seem to use average marginal effects more. This forum details the general process of average marginal effects()[https://www.statalist.org/forums/forum/general-stata-discussion/general/1465336-ordered-probit-marginal-effects].
 
 The basic idea is for each level of your dependent variable there should be a separate average marginal effect. The interpretation is then a one unit change in x is associated with a given probability of being in a category. 
 
-Based on the comparison below, it seems like margins solely produces the first level. The first level matches pretty well with the margins estimates. However, the other categories do not match. 
+There is a paper that use the same `nhanes2` dataset and provide average marginal effects by each outcome. The paper is [here](https://www3.nd.edu/~rwilliam/stats3/Margins05.pdf).
+
+The third page provides the comparison. I put them into a table and compared them with the `bayes_dydx_ordinal.factor`. The paper only provides the average marginal effects for the independent variable `black`. 
+
+```{r bayesSTATComp}
+
+tibble(`Health Status` = c("poor","fair", "average", "good", "excellent" ),
+       AME = c(.0738517 , .0926462, .0208514,-.0677142,-.1196351 )) %>% 
+  inner_join(BayesAME %>% 
+               mutate(`Health Status` = case_when(Category == 1 ~ "poor",
+                            Category == 2 ~"fair",
+                            Category == 3 ~"average",
+                            Category == 4 ~"good",
+                            Category == 5 ~"excellent")) %>%
+               filter(Var == "black") %>% 
+               select(`Health Status`,p50), by = "Health Status") %>%
+  mutate_if(is.numeric, ~round(., digit = 3)) %>% 
+  gt::gt() %>%
+  gt::tab_header(
+    title = "Average Marginal Effects Comparison - 2")
+
+
+```
+
+As we can see, our estimates line up close to the estimates provided by Richard Williams' paper discussed above. 
 
 ### Changes to the function: 
 
 The changes to the function are very few: 
 
-The first change results from `add_fitted_draws`. When we use this function with an ordinal regression model, it adds a variable to the output. The variable is called `.category` which represents the levels of the dependent variable. The simple alteration 
+The first change results from `add_fitted_draws`. When we use this function with an ordinal regression model, it adds a variable to the output. The variable is called `.category` which represents the levels of the dependent variable. 
+
+The change is simple: 
+
+*  From: `group_by_at(vars( ".category"))`
+*  To: `group_by_at(vars(".draw", ".category"))`
+
+This allows us to get a predicted draws from the data used to model. 
+
+```{r blkChange, echo = TRUE, eval = FALSE}
+
+ f[[i]] <- 
+      d %>% 
+      add_fitted_draws(model = model,
+                       re_formula = NULL,
+                       value = "eff") %>% 
+      ##### Need to include ordered within response variable
+      group_by_at(vars(".draw", ".category")) %>% 
+      #group_by_at(vars(".draw")) %>% 
+      summarise(
+        # eff = sum(eff),
+        # w = sum(w),
+        # eff_w_a = sum(eff*w),
+        eff_w = sum(eff * w)/sum(w)) %>% 
+      #dplyr::select(eff_w) %>% 
+      #dplyr::select(eff_w, w, eff, eff_w_a) %>% 
+      ungroup() %>% 
+      select(-.draw)
+    
+    # Compute contrast if not base level
+    if (i > 1){
+      f[[i]]$eff_w <- f[[i]]$eff_w - f[[1]][[2]] #### Change here because also included the order of response
+    }
+
+```
+ 
+The contrast code also needs to change as the `data.frame` `f[[1]]` now has two columns. The first column represents the category of outcome variable. 
+
+There are other changes regarding the format of the final output, but they are simple small changes using `dplyr`. 
+
+### Interpretation:
+
+The interpretation of the average marginal effects for an ordinal model, as discussed earlier is a one-unit change in the independent variable is associated with a x% change of being in a given category. 
