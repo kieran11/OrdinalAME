@@ -1,0 +1,256 @@
+---
+title: "Untitled"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+```
+
+
+The `R` package `margins` provides average marginal effects for any model developed with `lm` or `glm`, among many others. However, `margins` does not work with `brms`. Jack O'Bailey developed two functions for `brms` [here](https://gist.github.com/jackobailey/0982c89326c36b12d6fa6d6f182189be). There are two functions in this text file. The first function gets the average marginal effects for continuous independent variables. The second function get the average marginal effects for categorical variables. The link compares the results of the two functions with the `margins` command from the package `margins`. If you run the example, you can see that the results are remarkably similar. 
+
+Using the code above, this post attempts to recreate the functionality of the `margins` command from the `margins` package with ordinal logistic regression models. 
+
+```{r cars}
+# Load packages
+library(brms)
+library(tidybayes)
+library(tidyverse)
+library(magrittr)
+library(reshape2)
+library(margins)
+
+
+
+```
+
+
+The adapted function is below: 
+
+```{r func , echo = TRUE}
+
+bayes_dydx_ordinal.factor <- function(model, data = NULL, variable, re_formula = NULL){
+  
+  # Get data from model where data = NULL
+  if(is.null(data) == T){
+    d <- model$data
+  } else {
+    d <- data
+  }
+
+  
+  # Get outcome from model
+  resp <- model$formula$resp
+  resp_ord <- model$formula$resp
+  # Omit outcome from data
+  d <-
+    d %>%
+    dplyr::select(-resp)
+  
+  d <-
+    d %>% 
+    group_by_all() %>% 
+    count(name = "w") %>% 
+    ungroup()
+  
+
+  # Get factor levels
+  levs <- levels(as.factor(d[[variable]]))
+  base <- levs[1L]
+  cont <- levs[-1L]
+  
+  
+  # Create empty list for fitted draws
+  f <- list()
+  
+  # For each list add fitted draws
+  for (i in seq_along(levs)){
+    
+    # Fix variable in each list to factor level
+    d[[variable]] <- levs[i]
+    
+    f[[i]] <- 
+      d %>% 
+      add_fitted_draws(model = model,
+                       re_formula = NULL,
+                       value = "eff") %>% 
+      ##### Need to include ordered within response variable
+      group_by_at(vars(".draw", ".category")) %>% 
+      #group_by_at(vars(".draw")) %>% 
+      summarise(
+        # eff = sum(eff),
+        # w = sum(w),
+        # eff_w_a = sum(eff*w),
+        eff_w = sum(eff * w)/sum(w)) %>% 
+      #dplyr::select(eff_w) %>% 
+      #dplyr::select(eff_w, w, eff, eff_w_a) %>% 
+      ungroup() %>% 
+      select(-.draw)
+    
+    # Compute contrast if not base level
+    if (i > 1){
+      f[[i]]$eff_w <- f[[i]]$eff_w - f[[1]][[2]] #### Change here because also included the order of response
+    }
+    
+    # # Rename column
+    names(f[[i]]) <- c(paste0("Category", levs[i]), levs[i])
+    #names(f[[i]]) <- levs[i]
+    
+  }
+
+  # Remove data frame
+  d <- NULL
+  
+  # Create output object
+  out <- do.call(cbind, f)
+
+  # Return AMEs
+  if (length(cont) == 1){
+    
+    out <- out %>% tibble() %>% select(1,cont)
+    names(out)[2] <- "est"
+    
+    out %>% 
+      mutate(
+        var = variable,
+        resp = cont
+      ) %>% 
+      dplyr::select(Category=1,var, resp, est)
+    
+  } else {
+    
+    out %>% 
+      select(1, cont) %>% 
+      tidyr::pivot_longer(cols = -1 ,
+                          names_to = "variable", values_to = "value") %>%
+      rename(resp = variable, est = value,
+             Category = 1)
+    
+    
+  }
+  
+} ### Close Function
+
+
+
+```
+
+The example is from [here](https://stats.idre.ucla.edu/r/dae/ordinal-logistic-regression/). 
+
+Below is the example for `margins`. 
+
+```{r EG}
+
+dat <- foreign::read.dta("https://stats.idre.ucla.edu/stat/data/ologit.dta") %>% 
+  mutate(gpa_grp = case_when(gpa < 2.85 ~ "C",
+                             gpa >= 2.85 & gpa < 3.3 ~ "B",
+                             TRUE ~ "A"),
+         apply = ordered(apply, levels = c("unlikely", 
+                                           "somewhat likely", 
+                                           "very likely"))) %>% 
+  mutate_at(vars(pared, public), as.factor)
+
+ord_m_flat <- MASS::polr( apply ~ pared + public + gpa_grp, data = dat, Hess=TRUE)
+
+
+```
+
+We next run the ordinal Bayesian model using `brms`. The code is below: 
+
+```{r Bayes , echo = TRUE}
+
+# Fit Bayesian model
+bayes_ordinal <- brm(formula = apply ~ pared + public+gpa_grp,
+             family=cumulative("logit"),
+             prior = c(prior(normal( 0, 1), class = b)),
+             data = dat,
+            warmup = 2000, 
+            iter = 4000, 
+             chains = 2,
+             cores = 2)
+
+
+
+```
+
+
+As a first step, we can compare the log odds ratios between the Bayesian model with normally distributed priors and the previous model with flat priors: 
+
+```{r fixed}
+
+FixedBayes_a = brms::fixef(bayes_ordinal)
+
+FixedBayes = FixedBayes_a %>% 
+  as_tibble() %>% 
+  bind_cols(rownames(FixedBayes_a) %>% as_tibble()) %>% 
+  mutate(term = case_when(value == "Intercept[1]" ~ "unlikely|somewhat likely",
+                          value == "Intercept[2]" ~ "somewhat likely|very likely",
+                          TRUE ~ value)) %>%
+  select(-value , -Est.Error) %>% 
+  inner_join(broom::tidy(ord_m_flat , conf.int = TRUE) %>% 
+               select(term,estimate, conf.low, conf.high), by = "term") %>% 
+  select(term , Estimate, Q2.5, Q97.5 , estimate, conf.low, conf.high) %>% 
+  mutate_if(is.numeric , ~ round(. , digits = 3))
+
+
+```
+
+As we can see, the coefficients are of similar value. 
+
+```{r CoefCompare}
+
+CoefTableComp <- 
+  gt::gt(data = FixedBayes) %>%
+  gt::tab_header(
+    title = "Coefficient Comparison"
+  ) %>%
+  gt::tab_spanner(
+    label = "Bayesian Model Estimates",
+    columns = vars(Estimate,Q2.5,Q97.5)
+  ) %>% 
+  gt::tab_spanner(
+    label = "Flat Prior Model Estimates",
+    columns = vars(estimate, conf.low, conf.high)
+  ) 
+
+CoefTableComp
+
+```
+
+We next use the adapted function `bayes_dydx_ordinal.factor` to compare the marginal effects. 
+
+```{r Comparison}
+
+marginalEff = margins::margins(ord_m_flat)
+
+AMEByVar = function(x) {
+
+  ParedEst = bayes_dydx_ordinal.factor(bayes_ordinal , variable = x ) %>% 
+    group_by(Category) %>% 
+    summarise(p50 = median(est)) %>% 
+    ungroup() %>% 
+    mutate(Var = x)
+
+}
+
+
+BayesAME = purrr::map(as.list(c("pared", "public", "gpa_grp")), AMEByVar) %>% 
+  bind_rows(.)
+
+```
+
+Below we compare the marginal effects from the `bayes_dydx_ordinal.factor` function to the `margins` function. Importantly, there is no documentation on how `margins` works with ordinal regressions. There is great documentation [here]() and a great technical [paper](), but neither covers ordinal regression.  
+
+STATA users seem to use average marginal effects more. This forum details the general process of average marginal effects()[https://www.statalist.org/forums/forum/general-stata-discussion/general/1465336-ordered-probit-marginal-effects].
+
+The basic idea is for each level of your dependent variable there should be a separate average marginal effect. The interpretation is then a one unit change in x is associated with a given probability of being in a category. 
+
+Based on the comparison below, it seems like margins solely produces the first level. The first level matches pretty well with the margins estimates. However, the other categories do not match. 
+
+### Changes to the function: 
+
+The changes to the function are very few: 
+
+The first change results from `add_fitted_draws`. When we use this function with an ordinal regression model, it adds a variable to the output. The variable is called `.category` which represents the levels of the dependent variable. The simple alteration 
